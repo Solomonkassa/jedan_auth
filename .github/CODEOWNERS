@@ -1,0 +1,181 @@
+# .github/CODEOWNERS
+#
+# Code ownership for Jedan-Auth repository
+# Project URL: https://github.com/jedan-auth/jedan-auth
+# Lines are checked in order, last matching pattern takes precedence
+# Documentation: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# ============================================================================
+# SECURITY-CRITICAL SECTIONS (Require Security Council Approval)
+# ============================================================================
+
+# Core authentication engine - highest security requirements
+/jedan_auth/core/                    @jedan-auth/security-council @jedan-auth/principal-engineers
+/jedan_auth/security/                @jedan-auth/security-council @jedan-auth/security-engineers
+/jedan_auth/crypto/                  @jedan-auth/security-council @jedan-auth/cryptography-team
+/jedan_auth/providers/base.py        @jedan-auth/security-council @jedan-auth/auth-providers-team
+
+# Authentication models and database schemas - data protection critical
+/jedan_auth/models/                  @jedan-auth/data-architects @jedan-auth/security-engineers
+/jedan_auth/database/migrations/     @jedan-auth/data-architects @jedan-auth/database-team
+
+# API and external interfaces - public attack surface
+/jedan_auth/api/                     @jedan-auth/api-architects @jedan-auth/security-engineers
+/jedan_auth/schemas/                 @jedan-auth/api-architects @jedan-auth/data-architects
+
+# ============================================================================
+# AUTHENTICATION PROVIDERS (Domain Experts Required)
+# ============================================================================
+
+# Email-based authentication
+/jedan_auth/providers/email/         @jedan-auth/auth-providers-team
+
+# Social authentication (OAuth/OpenID Connect)
+/jedan_auth/providers/social/        @jedan-auth/social-auth-team @jedan-auth/oauth-experts
+
+# Multi-factor authentication
+/jedan_auth/providers/mfa/           @jedan-auth/mfa-team @jedan-auth/security-engineers
+
+# Passwordless and WebAuthn authentication
+/jedan_auth/providers/passwordless/  @jedan-auth/passwordless-team @jedan-auth/security-council
+
+# ============================================================================
+# BUSINESS LOGIC AND SERVICES (Service Architects Required)
+# ============================================================================
+
+# Service layer - business logic
+/jedan_auth/services/                @jedan-auth/service-architects
+
+# Webhook system - external integrations
+/jedan_auth/webhooks/                @jedan-auth/webhooks-team @jedan-auth/security-engineers
+
+# ============================================================================
+# USER INTERFACE AND FRONTEND (Design System Required)
+# ============================================================================
+
+# Frontend components and SDKs
+/jedan_auth/ui/                      @jedan-auth/frontend-architects @jedan-auth/design-system-team
+
+# Email and notification templates
+/jedan_auth/templates/               @jedan-auth/frontend-engineers @jedan-auth/security-engineers
+
+# Admin dashboard and interfaces
+/jedan_auth/admin/                   @jedan-auth/admin-team @jedan-auth/security-engineers
+
+# ============================================================================
+# INFRASTRUCTURE AND OPERATIONS (DevOps/SRE Required)
+# ============================================================================
+
+# Containerization and orchestration
+/docker/                             @jedan-auth/devops @jedan-auth/sre-team
+/helm/                               @jedan-auth/devops @jedan-auth/kubernetes-team
+
+# Infrastructure as Code
+/terraform/                          @jedan-auth/devops @jedan-auth/cloud-team
+
+# Configuration management
+/config/                             @jedan-auth/devops @jedan-auth/security-engineers
+
+# CI/CD pipelines and automation
+/.github/workflows/                  @jedan-auth/devops @jedan-auth/security-council
+/Makefile                            @jedan-auth/devops @jedan-auth/core-maintainers
+
+# Deployment and utility scripts
+/scripts/                            @jedan-auth/devops @jedan-auth/security-engineers
+
+# ============================================================================
+# DOCUMENTATION AND EXAMPLES (Technical Writers Required)
+# ============================================================================
+
+# API documentation and guides
+/docs/                               @jedan-auth/technical-writers @jedan-auth/docs-team
+
+# Example implementations
+/examples/                           @jedan-auth/solutions-architects @jedan-auth/developer-advocates
+
+# Performance benchmarks
+/benchmarks/                         @jedan-auth/performance-team @jedan-auth/sre-team
+
+# ============================================================================
+# CLIENT INTEGRATIONS AND SDKs (SDK Team Required)
+# ============================================================================
+
+# Generated client SDKs
+/client-sdks/                        @jedan-auth/sdk-team @jedan-auth/api-architects
+
+# Third-party integrations
+/jedan_auth/integrations/            @jedan-auth/integrations-team @jedan-auth/partner-engineering
+
+# ============================================================================
+# QUALITY ASSURANCE AND TESTING (Quality Team Required)
+# ============================================================================
+
+# Test suites and frameworks
+/tests/                              @jedan-auth/quality-team @jedan-auth/security-engineers
+/jedan_auth/testing/                 @jedan-auth/quality-team @jedan-auth/test-architects
+
+# Security testing and penetration tests
+/security/penetration-tests/         @jedan-auth/security-council @jedan-auth/red-team
+
+# ============================================================================
+# PROJECT CONFIGURATION (Core Maintainers Required)
+# ============================================================================
+
+# Package and dependency management
+pyproject.toml                       @jedan-auth/core-maintainers @jedan-auth/devops
+poetry.lock                          @jedan-auth/core-maintainers @jedan-auth/devops
+requirements*.txt                    @jedan-auth/devops @jedan-auth/security-engineers
+
+# Container definitions
+Dockerfile*                          @jedan-auth/devops @jedan-auth/security-council
+docker-compose*.yml                  @jedan-auth/devops @jedan-auth/security-engineers
+
+# ============================================================================
+# DEFAULT OWNERSHIP (Catch-all for all other files)
+# ============================================================================
+
+# All other files require core maintainer and security council review
+*                                    @jedan-auth/core-maintainers @jedan-auth/security-council
+
+# ============================================================================
+# TEAM DEFINITIONS AND RESPONSIBILITIES
+# ============================================================================
+#
+# @jedan-auth/security-council        Ultimate authority on security decisions
+# @jedan-auth/core-maintainers        Core project maintainers and technical leadership
+# @jedan-auth/principal-engineers     Senior technical architects and principal engineers
+# @jedan-auth/security-engineers      Application security specialists and security architects
+# @jedan-auth/cryptography-team       Cryptography experts and cryptographic protocol specialists
+# @jedan-auth/data-architects         Database design, schema architecture, and data modeling
+# @jedan-auth/api-architects          API design, REST/GraphQL architecture, and interface design
+# @jedan-auth/auth-providers-team     Authentication protocol implementation and provider development
+# @jedan-auth/social-auth-team        OAuth 2.0, OpenID Connect, and social authentication specialists
+# @jedan-auth/mfa-team                Multi-factor authentication and step-up authentication experts
+# @jedan-auth/passwordless-team       WebAuthn, FIDO2, and passwordless authentication specialists
+# @jedan-auth/service-architects      Business logic, service design, and domain modeling
+# @jedan-auth/webhooks-team           Webhook systems, event-driven architecture, and external integrations
+# @jedan-auth/frontend-architects     Frontend architecture, component design, and user interface
+# @jedan-auth/design-system-team      Design systems, UI components, and user experience
+# @jedan-auth/admin-team              Admin interfaces, dashboard design, and management tools
+# @jedan-auth/devops                  Infrastructure, deployment, and CI/CD pipeline management
+# @jedan-auth/sre-team                Site reliability, monitoring, alerting, and incident response
+# @jedan-auth/kubernetes-team         Kubernetes orchestration, Helm charts, and container management
+# @jedan-auth/cloud-team              Cloud infrastructure, networking, and infrastructure as code
+# @jedan-auth/technical-writers       Documentation, technical writing, and user guides
+# @jedan-auth/docs-team               Documentation management, information architecture, and content strategy
+# @jedan-auth/solutions-architects    Solution architecture, reference implementations, and best practices
+# @jedan-auth/developer-advocates     Developer experience, community engagement, and advocacy
+# @jedan-auth/performance-team        Performance optimization, benchmarking, and scalability testing
+# @jedan-auth/sdk-team                Client SDK development, API clients, and language bindings
+# @jedan-auth/integrations-team       Third-party integrations, partner APIs, and external services
+# @jedan-auth/partner-engineering     Partner integrations, enterprise solutions, and custom deployments
+# @jedan-auth/quality-team            Quality assurance, testing strategy, and release management
+# @jedan-auth/test-architects         Testing frameworks, test architecture, and automation strategy
+# @jedan-auth/red-team                Offensive security, penetration testing, and vulnerability assessment
+# @jedan-auth/oauth-experts           OAuth 2.0 protocol experts, OpenID Connect, and authorization servers
+# @jedan-auth/database-team           Database operations, query optimization, and data migration specialists
+#
+# Last Updated: 2026-02-03
+# Version: 1.0.0
+# Project: Jedan-Auth
+# Repository: https://github.com/jedan-auth/jedan-auth
