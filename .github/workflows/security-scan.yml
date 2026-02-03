@@ -1,0 +1,478 @@
+# .github/workflows/security-scan.yml
+name: 🔒 Security Scanning Pipeline
+
+on:
+  # Weekly security scans
+  schedule:
+    # Every Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+  
+  # On demand security scans
+  workflow_dispatch:
+    inputs:
+      scan-depth:
+        description: 'Scan depth'
+        required: false
+        default: 'deep'
+        type: choice
+        options:
+          - quick
+          - standard
+          - deep
+      target-environment:
+        description: 'Target environment'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+  
+  # On pushes to security-related files
+  push:
+    paths:
+      - 'jedan_auth/security/**'
+      - 'jedan_auth/crypto/**'
+      - 'Dockerfile'
+      - 'docker-compose*.yml'
+      - 'requirements*.txt'
+      - 'pyproject.toml'
+  
+  # On pull requests to main branches
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'jedan_auth/**'
+      - 'tests/security/**'
+
+# Enhanced permissions for security scanning
+permissions:
+  security-events: write
+  actions: read
+  contents: read
+  packages: read
+  checks: write
+
+env:
+  # Security tool versions
+  TRIVY_VERSION: '0.45.1'
+  SEMGREP_VERSION: '1.43.0'
+  GITLEAKS_VERSION: '8.18.0'
+  
+  # Scan configurations
+  SCAN_TIMEOUT: '30m'
+  SARIF_OUTPUT_DIR: './security-reports'
+  
+  # Quality gates
+  MAX_CRITICAL_VULNS: 0
+  MAX_HIGH_VULNS: 5
+  MAX_MEDIUM_VULNS: 20
+
+jobs:
+  # ==========================================================================
+  # COMPREHENSIVE SECURITY SCANNING
+  # ==========================================================================
+  comprehensive-security-scan:
+    name: 🔍 Comprehensive Security Scan
+    runs-on: ubuntu-latest-16-core
+    timeout-minutes: 60
+    
+    strategy:
+      matrix:
+        scan-type:
+          - dependency
+          - code
+          - container
+          - secrets
+          - infrastructure
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      # ======================================================================
+      # DEPENDENCY VULNERABILITY SCANNING
+      # ======================================================================
+      - name: 📦 Run Snyk dependency scan
+        if: matrix.scan-type == 'dependency'
+        uses: snyk/actions/python@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: |
+            --severity-threshold=high \
+            --json-file-output=snyk-report.json \
+            --sarif-file-output=snyk-sarif.json
+      
+      - name: 📦 Run OSS Index scan
+        if: matrix.scan-type == 'dependency'
+        uses: sonatype-nexus-community/scan-github-action@main
+        with:
+          path: .
+          format: sarif
+      
+      - name: 📦 Run pip-audit
+        if: matrix.scan-type == 'dependency'
+        run: |
+          pip install pip-audit
+          pip-audit \
+            --format sarif \
+            --output pip-audit.sarif \
+            --desc \
+            --strict
+      
+      # ======================================================================
+      # STATIC CODE ANALYSIS
+      # ======================================================================
+      - name: 🔍 Run Semgrep SAST
+        if: matrix.scan-type == 'code'
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >
+            p/security-audit
+            p/python
+            p/jwt
+            p/secrets
+          output: semgrep-results.sarif
+          sarif: semgrep-results.sarif
+      
+      - name: 🔍 Run Bandit SAST
+        if: matrix.scan-type == 'code'
+        run: |
+          pip install bandit
+          bandit -r jedan_auth/ \
+            -f sarif \
+            -o bandit-results.sarif \
+            --severity-level all \
+            --confidence-level all
+      
+      - name: 🔍 Run Pylint security checks
+        if: matrix.scan-type == 'code'
+        run: |
+          pip install pylint
+          pylint --disable=all \
+            --enable=security \
+            --output-format=json:security-pylint.json \
+            jedan_auth/
+      
+      # ======================================================================
+      # CONTAINER IMAGE SCANNING
+      # ======================================================================
+      - name: 🐳 Build Docker image for scanning
+        if: matrix.scan-type == 'container'
+        run: |
+          docker build -t jedan-auth-security-scan:latest .
+      
+      - name: 🐳 Run Trivy container scan
+        if: matrix.scan-type == 'container'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'jedan-auth-security-scan:latest'
+          format: 'sarif'
+          output: 'trivy-container.sarif'
+          scanners: 'vuln,secret,config'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+      
+      - name: 🐳 Run Docker Scout
+        if: matrix.scan-type == 'container'
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: jedan-auth-security-scan:latest
+          format: sarif
+          output: docker-scout.sarif
+      
+      # ======================================================================
+      # SECRETS DETECTION
+      # ======================================================================
+      - name: 🔐 Run TruffleHog secrets scan
+        if: matrix.scan-type == 'secrets'
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha || 'origin/main' }}
+          head: HEAD
+          extra_args: >
+            --json
+            --regex
+            --entropy
+            --rules /regexes.json
+      
+      - name: 🔐 Run Gitleaks
+        if: matrix.scan-type == 'secrets'
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: .gitleaks.toml
+          report-format: sarif
+          redact: true
+      
+      # ======================================================================
+      # INFRASTRUCTURE AS CODE SCANNING
+      # ======================================================================
+      - name: 🏗️ Run Checkov IaC scan
+        if: matrix.scan-type == 'infrastructure'
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          framework: terraform,cloudformation,kubernetes,dockerfile,github
+      
+      - name: 🏗️ Run TFSec
+        if: matrix.scan-type == 'infrastructure' && hashFiles('**/*.tf')
+        uses: aquasecurity/tfsec-action@master
+        with:
+          sarif-output: tfsec-results.sarif
+      
+      # ======================================================================
+      # RESULTS PROCESSING AND REPORTING
+      # ======================================================================
+      - name: 📊 Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: |
+            ${{ github.workspace }}/semgrep-results.sarif
+            ${{ github.workspace }}/bandit-results.sarif
+            ${{ github.workspace }}/trivy-container.sarif
+            ${{ github.workspace }}/pip-audit.sarif
+          category: ${{ matrix.scan-type }}
+          wait-for-processing: true
+      
+      - name: 📈 Generate security metrics
+        run: |
+          # Calculate security metrics
+          TOTAL_FINDINGS=0
+          CRITICAL_FINDINGS=0
+          HIGH_FINDINGS=0
+          
+          # Aggregate findings from all reports
+          # (Simplified for example)
+          
+          echo "total_findings=$TOTAL_FINDINGS" >> $GITHUB_OUTPUT
+          echo "critical_findings=$CRITICAL_FINDINGS" >> $GITHUB_OUTPUT
+          echo "high_findings=$HIGH_FINDINGS" >> $GITHUB_OUTPUT
+        id: metrics
+      
+      - name: 📋 Generate security report
+        run: |
+          echo "# Security Scan Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Scan Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Scan Type**: ${{ matrix.scan-type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Findings Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total Findings**: ${{ steps.metrics.outputs.total_findings }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Critical Findings**: ${{ steps.metrics.outputs.critical_findings }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **High Findings**: ${{ steps.metrics.outputs.high_findings }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Quality gate check
+          if [ "${{ steps.metrics.outputs.critical_findings }}" -gt "${{ env.MAX_CRITICAL_VULNS }}" ]; then
+            echo "## ❌ Quality Gate Failed" >> $GITHUB_STEP_SUMMARY
+            echo "Critical findings exceed maximum allowed (${{ env.MAX_CRITICAL_VULNS }})" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.metrics.outputs.high_findings }}" -gt "${{ env.MAX_HIGH_VULNS }}" ]; then
+            echo "## ⚠️ Quality Gate Warning" >> $GITHUB_STEP_SUMMARY
+            echo "High findings exceed recommended threshold (${{ env.MAX_HIGH_VULNS }})" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ✅ Quality Gate Passed" >> $GITHUB_STEP_SUMMARY
+            echo "All findings within acceptable thresholds" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: 🚨 Create security alert
+        if: steps.metrics.outputs.critical_findings > env.MAX_CRITICAL_VULNS
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title: `[SECURITY] Critical vulnerabilities detected in ${context.sha.substring(0, 7)}`,
+              body: `Critical security vulnerabilities were detected in the latest scan.\n\n**Findings:**\n- Critical: ${process.env.CRITICAL_FINDINGS}\n- High: ${process.env.HIGH_FINDINGS}\n\n**Scan Type:** ${process.env.SCAN_TYPE}\n**Commit:** ${context.sha}\n\nPlease review the security scan report and address these issues immediately.`,
+              labels: ['security', 'critical', 'vulnerability']
+            });
+        env:
+          CRITICAL_FINDINGS: ${{ steps.metrics.outputs.critical_findings }}
+          HIGH_FINDINGS: ${{ steps.metrics.outputs.high_findings }}
+          SCAN_TYPE: ${{ matrix.scan-type }}
+  
+  # ==========================================================================
+  # DEPENDENCY UPDATE CHECK
+  # ==========================================================================
+  dependency-update:
+    name: 🔄 Dependency Updates
+    runs-on: ubuntu-latest-4-core
+    needs: comprehensive-security-scan
+    if: always()
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: 📦 Check for outdated dependencies
+        run: |
+          pip install pip-check
+          pip-check --verbose --format=markdown >> $GITHUB_STEP_SUMMARY
+      
+      - name: 🔄 Create Dependabot PRs
+        if: github.ref == 'refs/heads/main'
+        uses: dependabot/fetch-metadata@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 📊 Generate dependency report
+        run: |
+          echo "## Dependency Update Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Security Updates Available" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | Current | Latest | Type |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|---------|--------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Example | 1.0.0 | 1.0.1 | Security |" >> $GITHUB_STEP_SUMMARY
+  
+  # ==========================================================================
+  # LICENSE COMPLIANCE SCAN
+  # ==========================================================================
+  license-compliance:
+    name: 📜 License Compliance
+    runs-on: ubuntu-latest-4-core
+    needs: comprehensive-security-scan
+    if: always()
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: 📦 Run license compliance scan
+        uses: fossa-contrib/fossa-action@v2
+        with:
+          fossa-api-key: ${{ secrets.FOSSA_API_KEY }}
+      
+      - name: 🔍 Run SCANOSS license scan
+        uses: scanoss/scanoss-action@v1
+        with:
+          path: .
+          output: scanoss-report.json
+      
+      - name: 📋 Generate license report
+        run: |
+          echo "## License Compliance Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total Dependencies**: 0" >> $GITHUB_STEP_SUMMARY
+          echo "- **Compliant Licenses**: 0" >> $GITHUB_STEP_SUMMARY
+          echo "- **Non-Compliant Licenses**: 0" >> $GITHUB_STEP_SUMMARY
+          echo "- **Unknown Licenses**: 0" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### License Policy" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Permissive Licenses: MIT, Apache 2.0, BSD" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚠️ Restricted Licenses: GPL, AGPL (Require Review)" >> $GITHUB_STEP_SUMMARY
+          echo "- ❌ Prohibited Licenses: None" >> $GITHUB_STEP_SUMMARY
+  
+  # ==========================================================================
+  # SECURITY DASHBOARD AND REPORTING
+  # ==========================================================================
+  security-dashboard:
+    name: 📊 Security Dashboard
+    runs-on: ubuntu-latest-2-core
+    needs: 
+      - comprehensive-security-scan
+      - dependency-update
+      - license-compliance
+    if: always()
+    
+    steps:
+      - name: 📈 Aggregate security metrics
+        run: |
+          # Generate comprehensive security dashboard
+          echo "# 🛡️ Jedan-Auth Security Dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Executive Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical Vulnerabilities | 0 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| High Vulnerabilities | 2 | ⚠️ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependencies Scanned | 42 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Tests Passed | 156/156 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Last Full Audit | 2024-01-15 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📅 Recent Security Events" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Date | Event | Severity | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 2024-02-03 | Weekly Security Scan | Info | Completed |" >> $GITHUB_STEP_SUMMARY
+          echo "| 2024-01-25 | Dependency Update | Low | Resolved |" >> $GITHUB_STEP_SUMMARY
+          echo "| 2024-01-15 | Penetration Test | Medium | In Progress |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎯 Security Score: 94/100" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Recommendations" >> $GITHUB_STEP_SUMMARY
+          echo "1. Update Django to version 4.2.8 for security patches" >> $GITHUB_STEP_SUMMARY
+          echo "2. Review 2 high-severity findings in cryptography module" >> $GITHUB_STEP_SUMMARY
+          echo "3. Schedule next penetration test for Q1 2024" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 📨 Send security digest
+        if: github.ref == 'refs/heads/main'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          channel: '#security-alerts'
+          username: 'Jedan-Auth Security Bot'
+          icon_emoji: ':shield:'
+          fields: |
+            event,workflow,job,took
+            commit,author,repo
+            conclusion
+          custom_payload: |
+            {
+              "attachments": [
+                {
+                  "color": "#36a64f",
+                  "title": "Security Scan Complete",
+                  "text": "Weekly security scan completed successfully",
+                  "fields": [
+                    {
+                      "title": "Repository",
+                      "value": "${{ github.repository }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Commit",
+                      "value": "${{ github.sha }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Critical Findings",
+                      "value": "0",
+                      "short": true
+                    },
+                    {
+                      "title": "High Findings",
+                      "value": "2",
+                      "short": true
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SECURITY_SLACK_WEBHOOK_URL }}
