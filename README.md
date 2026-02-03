@@ -1,4 +1,4 @@
-# **Jedan-Auth: Production File Structure & Architecture**
+# **Jedan-Auth:  File Structure & Architecture**
 
 ```bash
 jedan-auth/
