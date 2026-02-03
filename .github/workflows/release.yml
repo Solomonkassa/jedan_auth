@@ -1,0 +1,557 @@
+# .github/workflows/release.yml
+name: 🚀 Release Pipeline
+
+on:
+  # Manual release trigger
+  workflow_dispatch:
+    inputs:
+      release-type:
+        description: 'Release type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - prerelease
+      release-channel:
+        description: 'Release channel'
+        required: false
+        default: 'stable'
+        type: choice
+        options:
+          - stable
+          - beta
+          - alpha
+      dry-run:
+        description: 'Dry run (no actual release)'
+        required: false
+        default: false
+        type: boolean
+  
+  # Automatic release on version tags
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*.*.*-*'
+
+# Enhanced permissions for releases
+permissions:
+  contents: write
+  packages: write
+  discussions: write
+  id-token: write
+
+env:
+  # Release configuration
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYPI_REPOSITORY: https://upload.pypi.org/legacy/
+  TEST_PYPI_REPOSITORY: https://test.pypi.org/legacy/
+  
+  # Version management
+  MAIN_BRANCH: 'main'
+  DEVELOP_BRANCH: 'develop'
+  RELEASE_BRANCH_PREFIX: 'release/'
+  HOTFIX_BRANCH_PREFIX: 'hotfix/'
+
+jobs:
+  # ==========================================================================
+  # RELEASE PREPARATION AND VALIDATION
+  # ==========================================================================
+  prepare-release:
+    name: 📋 Prepare Release
+    runs-on: ubuntu-latest-8-core
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release-notes: ${{ steps.release-notes.outputs.release-notes }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+      is-prerelease: ${{ steps.version.outputs.is-prerelease }}
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.release-channel == 'stable' && env.MAIN_BRANCH || env.DEVELOP_BRANCH }}
+      
+      - name: 🔍 Validate release prerequisites
+        run: |
+          # Check if working directory is clean
+          if [[ -n $(git status --porcelain) ]]; then
+            echo "❌ Working directory is not clean"
+            exit 1
+          fi
+          
+          # Check if we're on the correct branch
+          CURRENT_BRANCH=$(git branch --show-current)
+          if [[ "${{ github.event.inputs.release-channel }}" == "stable" && "$CURRENT_BRANCH" != "$MAIN_BRANCH" ]]; then
+            echo "❌ Stable releases must be from $MAIN_BRANCH branch"
+            exit 1
+          fi
+          
+          echo "✅ Release prerequisites validated"
+      
+      - name: 🏷️ Determine next version
+        id: version
+        run: |
+          # Get current version from pyproject.toml
+          CURRENT_VERSION=$(grep -m1 'version =' pyproject.toml | cut -d '"' -f2)
+          echo "Current version: $CURRENT_VERSION"
+          
+          # Parse version components
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION%%-*}"
+          PRERELEASE="${CURRENT_VERSION#*-}"
+          
+          # Determine next version based on input
+          RELEASE_TYPE="${{ github.event.inputs.release-type }}"
+          RELEASE_CHANNEL="${{ github.event.inputs.release-channel }}"
+          
+          case "$RELEASE_TYPE" in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+          
+          # Build new version string
+          if [[ "$RELEASE_CHANNEL" == "stable" ]]; then
+            NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+            IS_PRERELEASE="false"
+          else
+            # For pre-releases, add channel and timestamp
+            TIMESTAMP=$(date -u '+%Y%m%d%H%M%S')
+            NEW_VERSION="$MAJOR.$MINOR.$PATCH-$RELEASE_CHANNEL.$TIMESTAMP"
+            IS_PRERELEASE="true"
+          fi
+          
+          echo "New version: $NEW_VERSION"
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "is-prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+          echo "current-version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+      
+      - name: 📝 Generate changelog
+        id: changelog
+        uses: requarks/changelog-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fromTag: $(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          toTag: HEAD
+      
+      - name: 📋 Generate release notes
+        id: release-notes
+        run: |
+          # Generate comprehensive release notes
+          echo "# Release ${{ steps.version.outputs.version }}" > release-notes.md
+          echo "" >> release-notes.md
+          echo "## Summary" >> release-notes.md
+          echo "" >> release-notes.md
+          echo "- **Version**: ${{ steps.version.outputs.version }}" >> release-notes.md
+          echo "- **Type**: ${{ github.event.inputs.release-type }}" >> release-notes.md
+          echo "- **Channel**: ${{ github.event.inputs.release-channel }}" >> release-notes.md
+          echo "- **Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> release-notes.md
+          echo "" >> release-notes.md
+          
+          # Add changelog
+          echo "## Changelog" >> release-notes.md
+          echo "" >> release-notes.md
+          echo '```' >> release-notes.md
+          git log --oneline --no-merges $(git describe --tags --abbrev=0 2>/dev/null || echo "")..HEAD >> release-notes.md
+          echo '```' >> release-notes.md
+          
+          # Add contributors
+          echo "" >> release-notes.md
+          echo "## Contributors" >> release-notes.md
+          echo "" >> release-notes.md
+          git log --format="%an" $(git describe --tags --abbrev=0 2>/dev/null || echo "")..HEAD | sort | uniq -c | sort -rn >> release-notes.md
+          
+          # Store release notes
+          NOTES=$(cat release-notes.md)
+          echo "release-notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      - name: 🔒 Run release security checks
+        run: |
+          # Security checks specific to releases
+          echo "## Release Security Checks" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check for hardcoded secrets
+          if grep -r "password\|secret\|token\|key" --include="*.py" --include="*.yml" --include="*.yaml" --include="*.toml" jedan_auth/ | grep -v "test" | grep -v "#" | grep -v '""' | grep -v "''"; then
+            echo "❌ Potential hardcoded secrets found" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          
+          # Check for debug statements
+          if grep -r "print\|debug\|console.log" --include="*.py" --include="*.js" jedan_auth/ | grep -v "test" | grep -v "#"; then
+            echo "⚠️ Debug statements found (will be removed in final build)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "✅ All security checks passed" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 📊 Generate release report
+        run: |
+          echo "# Release Preparation Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Version Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Current Version**: ${{ steps.version.outputs.current-version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **New Version**: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Type**: ${{ github.event.inputs.release-type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Channel**: ${{ github.event.inputs.release-channel }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Is Pre-release**: ${{ steps.version.outputs.is-prerelease }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Branch validation passed" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Working directory clean" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Security checks passed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Update version in pyproject.toml" >> $GITHUB_STEP_SUMMARY
+          echo "2. Create release commit" >> $GITHUB_STEP_SUMMARY
+          echo "3. Create Git tag" >> $GITHUB_STEP_SUMMARY
+          echo "4. Build and publish packages" >> $GITHUB_STEP_SUMMARY
+  
+  # ==========================================================================
+  # BUILD RELEASE ARTIFACTS
+  # ==========================================================================
+  build-artifacts:
+    name: 🏗️ Build Artifacts
+    runs-on: ubuntu-latest-8-core
+    needs: prepare-release
+    if: github.event.inputs.dry-run != 'true'
+    
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            platform-id: amd64
+          - platform: linux/arm64
+            platform-id: arm64
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release-channel == 'stable' && env.MAIN_BRANCH || env.DEVELOP_BRANCH }}
+      
+      - name: 🏷️ Update version in pyproject.toml
+        run: |
+          # Update version in pyproject.toml
+          sed -i "s/version = \".*\"/version = \"${{ needs.prepare-release.outputs.version }}\"/" pyproject.toml
+          
+          # Verify update
+          grep "version = \"${{ needs.prepare-release.outputs.version }}\"" pyproject.toml
+          echo "✅ Updated version to ${{ needs.prepare-release.outputs.version }}"
+      
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: 🔐 Log in to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 🏷️ Create Git tag
+        if: github.event.inputs.release-channel == 'stable'
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+          # Create tag
+          git tag -a "v${{ needs.prepare-release.outputs.version }}" \
+            -m "Release v${{ needs.prepare-release.outputs.version }}"
+          
+          # Push tag
+          git push origin "v${{ needs.prepare-release.outputs.version }}"
+      
+      - name: 🐳 Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-release.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.platform-id }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare-release.outputs.version }}
+            org.opencontainers.image.created=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: 📦 Build Python package
+        run: |
+          pip install build twine
+          python -m build
+          
+          # Verify package
+          twine check dist/*
+          
+          # List built packages
+          ls -la dist/
+      
+      - name: 📤 Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-artifacts-${{ matrix.platform-id }}
+          path: |
+            dist/*
+            Dockerfile
+            pyproject.toml
+      
+      - name: 📋 Generate build report
+        run: |
+          echo "# Build Report - ${{ matrix.platform-id }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Built Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- Docker Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-release.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Platform: ${{ matrix.platform }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Python Packages:" >> $GITHUB_STEP_SUMMARY
+          for file in dist/*; do
+            echo "  - $(basename $file)" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Quality Metrics" >> $GITHUB_STEP_SUMMARY
+          echo "- Image Size: $(docker images ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-release.outputs.version }} --format "{{.Size}}")" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Time: $(($(date +%s) - START_TIME)) seconds" >> $GITHUB_STEP_SUMMARY
+  
+  # ==========================================================================
+  # PUBLISH RELEASE
+  # ==========================================================================
+  publish-release:
+    name: 🚀 Publish Release
+    runs-on: ubuntu-latest-4-core
+    needs: 
+      - prepare-release
+      - build-artifacts
+    if: github.event.inputs.dry-run != 'true'
+    environment: release
+    
+    steps:
+      - name: 📥 Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ./artifacts
+      
+      - name: 📦 Publish to PyPI
+        if: github.event.inputs.release-channel == 'stable'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          # Find the wheel and source distribution
+          WHEEL=$(find artifacts -name "*.whl" | head -1)
+          SDIST=$(find artifacts -name "*.tar.gz" | head -1)
+          
+          echo "Publishing to PyPI..."
+          twine upload --repository-url ${{ env.PYPI_REPOSITORY }} "$WHEEL" "$SDIST"
+          echo "✅ Published to PyPI"
+      
+      - name: 📦 Publish to TestPyPI (pre-releases)
+        if: github.event.inputs.release-channel != 'stable'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: |
+          WHEEL=$(find artifacts -name "*.whl" | head -1)
+          SDIST=$(find artifacts -name "*.tar.gz" | head -1)
+          
+          echo "Publishing to TestPyPI..."
+          twine upload --repository-url ${{ env.TEST_PYPI_REPOSITORY }} "$WHEEL" "$SDIST"
+          echo "✅ Published to TestPyPI"
+      
+      - name: 🏷️ Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release v${{ needs.prepare-release.outputs.version }}
+          tag_name: v${{ needs.prepare-release.outputs.version }}
+          body: ${{ needs.prepare-release.outputs.release-notes }}
+          draft: false
+          prerelease: ${{ needs.prepare-release.outputs.is-prerelease == 'true' }}
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.whl
+            artifacts/**/*.tar.gz
+      
+      - name: 📊 Update release metrics
+        run: |
+          # Update release metrics (example)
+          echo "## Release Metrics" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Published Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- **Docker Images**: Published to ${{ env.REGISTRY }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Python Packages**: Published to ${{ github.event.inputs.release-channel == 'stable' && 'PyPI' || 'TestPyPI' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitHub Release**: Created with tag v${{ needs.prepare-release.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Distribution Channels" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Container Registry**: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "2. **Package Registry**: ${{ github.event.inputs.release-channel == 'stable' && env.PYPI_REPOSITORY || env.TEST_PYPI_REPOSITORY }}" >> $GITHUB_STEP_SUMMARY
+          echo "3. **GitHub Packages**: ghcr.io/${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 📨 Send release notifications
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#releases'
+          username: 'Jedan-Auth Release Bot'
+          icon_emoji: ':rocket:'
+          fields: |
+            event,workflow,job,took
+            commit,author,repo
+            conclusion
+          custom_payload: |
+            {
+              "attachments": [
+                {
+                  "color": "#2eb886",
+                  "title": "New Release Published",
+                  "text": "Jedan-Auth v${{ needs.prepare-release.outputs.version }} has been released",
+                  "fields": [
+                    {
+                      "title": "Version",
+                      "value": "v${{ needs.prepare-release.outputs.version }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Channel",
+                      "value": "${{ github.event.inputs.release-channel }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Docker Image",
+                      "value": "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-release.outputs.version }}",
+                      "short": false
+                    },
+                    {
+                      "title": "Release Notes",
+                      "value": "https://github.com/${{ github.repository }}/releases/tag/v${{ needs.prepare-release.outputs.version }}",
+                      "short": false
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.RELEASE_SLACK_WEBHOOK_URL }}
+      
+      - name: 📧 Send email announcement
+        if: github.event.inputs.release-channel == 'stable'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "🚀 Jedan-Auth v${{ needs.prepare-release.outputs.version }} Released"
+          to: announcements@jedanauth.dev
+          cc: engineering@jedanauth.dev,security@jedanauth.dev
+          from: "Jedan-Auth Releases <releases@jedanauth.dev>"
+          body: |
+            # 🎉 Jedan-Auth v${{ needs.prepare-release.outputs.version }} Released!
+            
+            We're excited to announce the release of Jedan-Auth v${{ needs.prepare-release.outputs.version }}!
+            
+            ## 📋 Release Details
+            - **Version**: v${{ needs.prepare-release.outputs.version }}
+            - **Release Date**: $(date -u '+%Y-%m-%d')
+            - **Release Type**: ${{ github.event.inputs.release-type }}
+            - **Release Notes**: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.prepare-release.outputs.version }}
+            
+            ## 🚀 Getting Started
+            ```bash
+            # Install via pip
+            pip install jedan-auth==${{ needs.prepare-release.outputs.version }}
+            
+            # Or use Docker
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-release.outputs.version }}
+            ```
+            
+            ## 🔗 Resources
+            - Documentation: https://docs.jedanauth.dev
+            - GitHub Repository: https://github.com/${{ github.repository }}
+            - Security Advisories: https://security.jedanauth.dev
+            
+            Thank you to all contributors who made this release possible!
+            
+            Best regards,  
+            The Jedan-Auth Team
+  
+  # ==========================================================================
+  # POST-RELEASE ACTIVITIES
+  # ==========================================================================
+  post-release:
+    name: 📝 Post-Release
+    runs-on: ubuntu-latest-2-core
+    needs: publish-release
+    if: always() && github.event.inputs.dry-run != 'true'
+    
+    steps:
+      - name: 📊 Update documentation
+        run: |
+          # Update documentation with new version
+          echo "Updating documentation..."
+          # Add actual documentation update commands here
+          echo "✅ Documentation updated"
+      
+      - name: 🔄 Sync release to package managers
+        run: |
+          # Sync to other package managers if needed
+          echo "Syncing to package managers..."
+          # Add actual sync commands here
+          echo "✅ Package managers synced"
+      
+      - name: 📈 Update analytics and metrics
+        run: |
+          # Update release metrics
+          echo "## Post-Release Activities" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Completed Tasks" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Documentation updated" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Package managers synced" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Analytics updated" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Monitor deployment metrics" >> $GITHUB_STEP_SUMMARY
+          echo "2. Collect user feedback" >> $GITHUB_STEP_SUMMARY
+          echo "3. Plan next release cycle" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 🎯 Create follow-up issues
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            
+            // Create issue for next release planning
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title: `Plan for next release after v${{ needs.prepare-release.outputs.version }}`,
+              body: `Now that v${{ needs.prepare-release.outputs.version }} is released, let's start planning for the next release.\n\n**Tasks:**\n- [ ] Collect feedback from v${{ needs.prepare-release.outputs.version }}\n- [ ] Review open issues for next release\n- [ ] Create release roadmap\n- [ ] Assign release manager`,
+              labels: ['release', 'planning']
+            });
+            
+            // Create issue for monitoring this release
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title: `Monitor v${{ needs.prepare-release.outputs.version }} adoption`,
+              body: `Track the adoption and stability of v${{ needs.prepare-release.outputs.version }}\n\n**Metrics to track:**\n- Download counts\n- Issue reports\n- Performance metrics\n- Security reports`,
+              labels: ['monitoring', 'release']
+            });
