@@ -1,0 +1,558 @@
+# .github/workflows/ci-cd.yml
+name: 🔄 CI/CD Pipeline
+
+on:
+  # Trigger on pushes to main branches
+  push:
+    branches: [ main, develop, 'release/**' ]
+    tags: [ 'v*' ]
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.txt'
+      - '**/.gitignore'
+      - '**/.dockerignore'
+  
+  # Trigger on pull requests
+  pull_request:
+    branches: [ main, develop ]
+    types: [ opened, synchronize, reopened ]
+  
+  # Scheduled security scans
+  schedule:
+    # Weekly security scans (Sunday at 00:00 UTC)
+    - cron: '0 0 * * 0'
+  
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      skip_tests:
+        description: 'Skip tests'
+        required: false
+        type: boolean
+
+# Global environment variables
+env:
+  # Container registry configuration
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  
+  # Version configuration
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '18'
+  DOCKER_BUILDKIT: 1
+  
+  # Security scanning tools
+  SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+  SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+  TRIVY_USERNAME: ${{ github.actor }}
+  TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+  
+  # Quality gates
+  MIN_TEST_COVERAGE: 90
+  MAX_COMPLEXITY: 10
+
+# Job concurrency control
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================================================
+  # STAGE 1: SECURITY SCANNING
+  # ==========================================================================
+  security-scanning:
+    name: 🔒 Security Scanning
+    runs-on: ubuntu-latest-8-core
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+      packages: read
+    
+    strategy:
+      matrix:
+        scan-type: [sast, sca, secrets, container]
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: 📦 Install security tools
+        run: |
+          pip install bandit safety pip-audit semgrep
+          npm install -g @microsoft/sdl-mandates snyk
+      
+      # Static Application Security Testing (SAST)
+      - name: 🔍 Run Bandit SAST
+        if: matrix.scan-type == 'sast'
+        run: |
+          bandit -r jedan_auth/ \
+            -f json \
+            -o bandit-report.json \
+            --severity-level high \
+            --confidence-level high
+        continue-on-error: true
+      
+      - name: 📊 Upload Bandit results
+        if: matrix.scan-type == 'sast'
+        uses: actions/upload-artifact@v3
+        with:
+          name: bandit-report
+          path: bandit-report.json
+      
+      # Software Composition Analysis (SCA)
+      - name: 📦 Run dependency vulnerability scan
+        if: matrix.scan-type == 'sca'
+        run: |
+          safety check \
+            --json \
+            --output safety-report.json \
+            --cache \
+            --disable-telemetry
+          
+          pip-audit \
+            --format json \
+            --output pip-audit-report.json \
+            --desc \
+            --strict
+        continue-on-error: true
+      
+      - name: 📊 Upload SCA results
+        if: matrix.scan-type == 'sca'
+        uses: actions/upload-artifact@v3
+        with:
+          name: sca-reports
+          path: |
+            safety-report.json
+            pip-audit-report.json
+      
+      # Secret scanning
+      - name: 🔐 Run secret scanning
+        if: matrix.scan-type == 'secrets'
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha || github.sha }}
+          head: ${{ github.sha }}
+          extra_args: --json --regex
+      
+      # Container image scanning
+      - name: 🐳 Run Trivy container scan
+        if: matrix.scan-type == 'container'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: 📤 Upload security scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: trivy-results.sarif
+      
+      - name: 🚨 Create security summary
+        run: |
+          echo "## Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan Type**: ${{ matrix.scan-type }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+  
+  # ==========================================================================
+  # STAGE 2: CODE QUALITY AND LINTING
+  # ==========================================================================
+  code-quality:
+    name: 📝 Code Quality
+    runs-on: ubuntu-latest-4-core
+    needs: security-scanning
+    timeout-minutes: 15
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: 📦 Install dependencies
+        run: |
+          pip install -e ".[dev]"
+          pip install black flake8 isort mypy pylint radon
+      
+      - name: 🎨 Check code formatting (Black)
+        run: |
+          black --check --diff jedan_auth/ tests/
+      
+      - name: 📏 Run Flake8 linting
+        run: |
+          flake8 jedan_auth/ \
+            --max-line-length=88 \
+            --extend-ignore=E203,W503 \
+            --statistics
+      
+      - name: 🔄 Check import sorting (isort)
+        run: |
+          isort --check-only --diff jedan_auth/ tests/
+      
+      - name: 🔍 Run MyPy type checking
+        run: |
+          mypy jedan_auth/ \
+            --ignore-missing-imports \
+            --strict \
+            --warn-unused-configs \
+            --show-error-codes
+      
+      - name: 📊 Calculate code complexity
+        run: |
+          radon cc jedan_auth/ -s -a -i tests
+          radon mi jedan_auth/ -i tests
+      
+      - name: 📈 Generate code quality report
+        run: |
+          echo "## Code Quality Report" >> $GITHUB_STEP_SUMMARY
+          echo "### Metrics" >> $GITHUB_STEP_SUMMARY
+          echo "- **Python Version**: ${{ env.PYTHON_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Lines of Code**: $(find jedan_auth/ -name '*.py' | xargs wc -l | tail -1 | awk '{print $1}')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Complexity Threshold**: ${{ env.MAX_COMPLEXITY }}" >> $GITHUB_STEP_SUMMARY
+  
+  # ==========================================================================
+  # STAGE 3: TESTING
+  # ==========================================================================
+  testing:
+    name: 🧪 Testing
+    runs-on: ubuntu-latest-8-core
+    needs: code-quality
+    timeout-minutes: 45
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: jedan_auth
+          POSTGRES_PASSWORD: jedan_auth_test
+          POSTGRES_DB: jedan_auth_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      
+      - name: 📦 Install dependencies
+        run: |
+          pip install -e ".[dev,test]"
+          pip install coverage pytest-xdist
+      
+      - name: 🗄️ Set up test database
+        run: |
+          psql -h localhost -U jedan_auth -d jedan_auth_test -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
+      
+      - name: 🧪 Run unit tests
+        run: |
+          pytest tests/unit/ \
+            -v \
+            -n auto \
+            --tb=short \
+            --durations=10 \
+            --cov=jedan_auth \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-fail-under=${{ env.MIN_TEST_COVERAGE }}
+      
+      - name: 🔒 Run security tests
+        run: |
+          pytest tests/security/ \
+            -v \
+            --tb=short \
+            --strict-markers
+      
+      - name: 📊 Run integration tests
+        run: |
+          pytest tests/integration/ \
+            -v \
+            --tb=short \
+            --timeout=300
+      
+      - name: 📈 Upload coverage reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-reports-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/
+      
+      - name: 📤 Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+      
+      - name: 📋 Generate test report
+        run: |
+          echo "## Test Results - Python ${{ matrix.python-version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Coverage**: $(grep -oP '(?<=<coverage.*>).*?(?=</coverage>)' coverage.xml)%" >> $GITHUB_STEP_SUMMARY
+          echo "**Tests Passed**: $(pytest tests/ --collect-only | grep -c 'test_' || true)" >> $GITHUB_STEP_SUMMARY
+  
+  # ==========================================================================
+  # STAGE 4: BUILD AND PACKAGE
+  # ==========================================================================
+  build:
+    name: 🏗️ Build and Package
+    runs-on: ubuntu-latest-4-core
+    needs: testing
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    timeout-minutes: 20
+    
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      docker-tag: ${{ steps.version.outputs.docker-tag }}
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: 📦 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: 🔐 Log in to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 🏷️ Extract version metadata
+        id: version
+        run: |
+          # Use git tag for version, fallback to commit hash
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            DOCKER_TAG="v${VERSION}"
+          else
+            VERSION="$(git describe --tags --always --dirty)"
+            DOCKER_TAG="sha-${GITHUB_SHA:0:8}"
+          fi
+          
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "docker-tag=${DOCKER_TAG}" >> $GITHUB_OUTPUT
+          echo "Version: ${VERSION}"
+          echo "Docker Tag: ${DOCKER_TAG}"
+      
+      - name: 🐳 Build Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.docker-tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: 📦 Build Python package
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+      
+      - name: 📤 Upload Python package
+        uses: actions/upload-artifact@v3
+        with:
+          name: python-package
+          path: dist/*
+      
+      - name: 📋 Generate build report
+        run: |
+          echo "## Build Report" >> $GITHUB_STEP_SUMMARY
+          echo "**Version**: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Docker Tag**: ${{ steps.version.outputs.docker-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Platforms**: linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+  
+  # ==========================================================================
+  # STAGE 5: DEPLOYMENT
+  # ==========================================================================
+  deployment:
+    name: 🚀 Deployment
+    runs-on: ubuntu-latest-4-core
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 30
+    environment: production
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: 🔐 Log in to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 🏷️ Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+      
+      - name: 🐳 Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      
+      - name: 📦 Publish to PyPI
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          pip install twine
+          python -m twine upload dist/* --skip-existing
+      
+      - name: 🏷️ Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release ${{ needs.build.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+      
+      - name: 📋 Generate deployment report
+        run: |
+          echo "## Deployment Report" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment**: ${{ github.event.inputs.environment || 'production' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version**: ${{ needs.build.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+  
+  # ==========================================================================
+  # FINAL STAGE: NOTIFICATIONS AND SUMMARY
+  # ==========================================================================
+  notifications:
+    name: 📢 Notifications
+    runs-on: ubuntu-latest-2-core
+    needs: 
+      - security-scanning
+      - code-quality
+      - testing
+      - build
+      - deployment
+    if: always()
+    
+    steps:
+      - name: 📊 Generate workflow summary
+        run: |
+          echo "# CI/CD Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow**: ${{ github.workflow }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID**: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Job Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status | Duration |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|----------|" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 📨 Send Slack notification
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#ci-cd-alerts'
+          username: 'Jedan-Auth CI/CD Bot'
+          icon_emoji: ':github:'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      
+      - name: 📧 Send email notification
+        if: failure() && github.ref == 'refs/heads/main'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "CI/CD Pipeline Failed: ${{ github.workflow }}"
+          to: devops@jedanauth.dev
+          from: "Jedan-Auth CI/CD <ci-cd@jedanauth.dev>"
+          body: |
+            Pipeline ${{ github.workflow }} failed.
+            
+            Repository: ${{ github.repository }}
+            Run ID: ${{ github.run_id }}
+            Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref }}
+            
+            Please check the workflow run for details.
